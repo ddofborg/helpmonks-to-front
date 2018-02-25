@@ -1,0 +1,326 @@
+#!/usr/bin/env ruby
+
+require 'ap'
+require 'thor'
+require 'rest_client'
+require 'pry'
+require 'vcr'
+require 'frontapp'
+require 'active_support/all'
+
+class Migrate < Thor
+  desc "migrate --helpmonks_token [API-KEY] --helpmonks_subdomain [SUBDOMAIN] --frontapp_token [API-TOKEN] --frontapp_inbox_id [INBOX-ID]", "Imports messages from Helpmonks to Front."
+  method_option :helpmonks_token, aliases: "--helpmonks_token", desc: "Specify the API key from Helpmonks (go to > My profile > Api Keys)"
+  method_option :helpmonks_subdomain, aliases: "--helpmonks_subdomain", desc: "Specify the subdomain of Helpmonks account"
+  method_option :frontapp_token, aliases: "--frontapp_token", desc: "Specify the API token from Front (go to > Plugins & API > API)"
+  method_option :frontapp_inbox_id, aliases: "--frontapp_inbox_id", desc: "Specify the inbox id"
+  def migrate
+    @helpmonks_token = options[:helpmonks_token]
+    @helpmonks_subdomain = options[:helpmonks_subdomain]
+    @frontapp_token = options[:frontapp_token]
+    @frontapp_inbox_id = options[:frontapp_inbox_id]
+    configure_vcr
+    do_migrate
+  end
+
+  desc "frontapp_inboxes --frontapp_token [API-TOKEN]", "List all inboxes from Front."
+  method_option :frontapp_token, aliases: "--frontapp_token", desc: "Specify the API token from Front (go to > Plugins & API > API)"
+  def frontapp_inboxes
+    @frontapp_token = options[:frontapp_token]
+    inboxes = frontapp.inboxes
+    ap inboxes
+  end
+
+  desc "frontapp_teammates --frontapp_token [API-TOKEN]", "List all teammates from Front."
+  method_option :frontapp_token, aliases: "--frontapp_token", desc: "Specify the API token from Front (go to > Plugins & API > API)"
+  def frontapp_teammates
+    @frontapp_token = options[:frontapp_token]
+    teammates = frontapp.teammates
+    ap teammates
+  end
+
+  private
+    def configure_vcr
+      VCR.configure do |c|
+        c.cassette_library_dir = ENV['CACHE_DIR'] || 'cache'
+        c.hook_into :webmock # or :fakeweb
+        c.filter_sensitive_data('HELPMONKS_API') do |interaction|
+          @helpmonks_token
+        end
+        c.allow_http_connections_when_no_cassette = true
+      end
+    end
+
+    def frontapp
+      @frontapp_client ||= Frontapp::Client.new(auth_token: @frontapp_token)
+    end
+
+    def read_resource_from_helpmonks(resource, id, pre = "    ")
+      @helpmonk_resources ||= {}
+      @helpmonk_resources[resource] ||= {}
+      return @helpmonk_resources[resource][id] if @helpmonk_resources[resource][id]
+      print "#{pre}Reading #{resource} #{id} from Helpmonks... ".white
+
+      requesting_helpmonks("helpmonks/#{resource}/#{id}", {
+        method: :get,
+        url: "https://#{@helpmonks_subdomain}.helpmonks.com/api/v1/#{resource}/findbyid/#{id}",
+      }) do |success, response|
+        if success
+          puts "OK :)".green
+          @helpmonk_resources[resource][id] = response
+          return @helpmonk_resources[resource][id]
+        else
+          puts "ERROR :(".red
+          return false
+        end
+      end
+    end
+
+    def teammates
+      VCR.use_cassette("teammates") do
+        @teammates = frontapp.teammates
+      end
+      @teammates
+    end
+
+    def teammates_by_email
+      @teammate_by_email = {}
+      teammates.each do |teammate|
+        @teammate_by_email[teammate['email']] = teammate['id']
+      end
+      @teammate_by_email
+    end
+
+    def create_contact_on_frontapp(customer)
+      # puts "--> Processing Customer #{customer['_id']}... ".white
+      VCR.use_cassette("frontapp/contacts/#{customer['_id']}") do
+        first_name = customer['first_name'].capitalize unless customer['first_name'].blank?
+        middle_name = customer['middle_name'].capitalize unless customer['middle_name'].blank?
+        last_name = customer['last_name'].capitalize unless customer['last_name'].blank?
+        @contact = frontapp.create_contact!({
+        	name: [first_name, middle_name, last_name].compact.join(" "),
+        	description: customer['notes'],
+        	is_spammer: false,
+        	group_names: ["Customer", "Helpmonks"],
+        	handles: [{
+            "handle": customer['email'],
+            "source": "email"
+          }]
+        })
+      end
+      @contacts ||= {}
+      @contacts[customer['_id']] = @contact
+    end
+
+    def save_message_on_front(message)
+      @version = 8 # each time we need to import the same messages again, we have to change this number, otherwise front will ignore the message. Front do not import a message with a external id that already exists.
+
+
+      puts "    Saving conversation #{message['_id']}... ".white
+
+      is_archived = ['archived','closed','spam','trash'].include?(message['status'])
+
+      if !message['assignee'].blank?
+        assignee = read_resource_from_helpmonks('user', message['assignee'])
+        assigne_id = teammates_by_email[assignee['email']]
+      end
+
+      message['emails'].reverse.each do |email|
+        # binding.pry if message['_id'] == "56f2e038666ab9d65bb9bdf1"
+        to_addresses = []
+        email['to'].each do |to_id|
+          to_addresses << @contacts[to_id]['handles'][0]['handle']
+        end
+
+        if !email['from']['user_id'].blank?
+          author = read_resource_from_helpmonks('user', email['from']['user_id'], "      ")
+          sender_author_id = teammates_by_email[author['email']]
+          sender_handle = author['email']
+          sender_name = [author['first_name'],author['last_name']].join(" ")
+          is_inbound = false
+          if to_addresses.blank? and !message['communication_with'].blank?
+            contact = read_resource_from_helpmonks('company_user',message['communication_with'].first, "      ")
+            to_addresses = [contact['email']]
+          end
+        elsif email['from']['company_user_id']
+          contact = @contacts[email['from']['company_user_id']]
+          sender_handle = contact['handles'][0]['handle']
+          sender_name = contact['name']
+          sender_author_id = nil
+          is_inbound = true
+        end
+
+        to_addresses = ['rafael@boletosimples.com'] if to_addresses.blank?
+        if !email['cc'].blank?
+          cc_addresses = email['cc'].gsub(" ","").split(",")
+        else
+          cc_addresses = []
+        end
+
+        if !email['bcc'].blank?
+          bcc_addresses = email['bcc'].gsub(" ","").split(",")
+        else
+          bcc_addresses = []
+        end
+
+        attachments = []
+        email['attachments'].each do |attachment|
+          url = URI::encode(attachment['s3url']).gsub("[","%5B").gsub("]","%5D")
+          uri = URI(url)
+          basename = File.basename(uri.path)
+          dirname = File.dirname(uri.path)
+          local_dirname = "cache/attachments#{dirname}"
+          local_path = "#{local_dirname}/#{basename}"
+          unless File.exists?(local_path)
+            FileUtils.mkdir_p(local_dirname)
+            # Save file locally
+            require 'open-uri'
+            File.open(local_path, "wb") do |saved_file|
+              open(url, "rb") do |read_file|
+                saved_file.write(read_file.read)
+              end
+            end
+          end
+          attachments << File.open(local_path)
+        end
+
+        print "      Saving email #{email['_id']}... ".white
+
+        multipart = !attachments.blank?
+        payload = {
+          multipart: multipart,
+          sender: {
+            handle: sender_handle,
+            name: sender_name,
+            author_id: sender_author_id,
+          },
+          to: to_addresses,
+          cc: cc_addresses,
+          bcc: bcc_addresses,
+          subject: email['subject'],
+          body: email['body'],
+          body_format: "html",
+          external_id: "v#{@version}/#{email['_id']}",
+          created_at: Time.parse(email['timestamp']).to_i,
+          type: 'email',
+          assignee_id: assigne_id,
+          attachments: attachments,
+          tags: [],
+          metadata: {
+            thread_ref: "v#{@version}/#{message['_id']}",
+            is_inbound: is_inbound,
+            is_archived: is_archived,
+            should_skip_rules: true
+          }
+        }
+        payload = payload.to_json unless multipart
+
+        VCR.use_cassette("frontapp/messages/v#{@version}/#{email['_id']}") do
+          @raw_response = RestClient::Request.new({
+            method: :post,
+            url: "https://api2.frontapp.com/inboxes/#{@frontapp_inbox_id}/imported_messages",
+            timeout: 1800,
+            headers: {
+              content_type: (multipart ? nil : :json),
+              accept: :json,
+              authorization: "Bearer #{@frontapp_token}",
+            },
+            payload: payload
+          }).execute { |response, request, result, &block|
+            case response.code
+            when 202
+              puts "    OK :)".green
+            else
+              puts "    FAIL :(".red
+              ap response
+              exit
+            end
+          }
+        end
+      end
+    end
+
+    def do_migrate
+      puts "--> Starting execution...".white
+      puts "    HELPMONKS API KEY: #{@helpmonks_token}".yellow
+      puts "    HELPMONKS SUBDOMAIN: #{@helpmonks_subdomain}".yellow
+      puts "    FRONTAPP TOKEN: #{@frontapp_token}".yellow
+      migrate_customers
+      migrate_messages
+    end
+
+    def migrate_customers
+      puts "--> Finding customers...".white
+      requesting_helpmonks("helpmonks-customers", {
+        method: :post,
+        url: "https://#{@helpmonks_subdomain}.helpmonks.com/api/v1/company_user/find",
+        payload: '
+        {
+          "query": {},
+          "options": {
+            "sort": {
+              "first_name": "asc"
+            }
+          }
+        }
+        '
+      }) do |success, response|
+        if success
+          puts "    Total of #{response.size} customers.".green
+          response.each do |customer|
+            create_contact_on_frontapp(customer)
+          end
+        else
+          puts "--> Error reading messages with status #{status} :(".red
+        end
+      end
+    end
+
+    def migrate_messages
+      puts "--> Finding messages...".white
+      ['inbox','assigned','archived','closed','spam','trash'].each do |status|
+        requesting_helpmonks("helpmonks-messages-#{status}", {
+          method: :post,
+          url: "https://#{@helpmonks_subdomain}.helpmonks.com/api/v1/conversation/find",
+          payload:
+          {
+            query: { status: status },
+            fields: {},
+            options: { sort: { last_conversation_date: 'asc' } }
+          }
+        }) do |success, response|
+          if success
+            puts "    Total of #{response.size} messages with status = #{status}.".green
+            response.map{|x|x['_id']}.each do |message_id|
+              puts "--> Processing Message #{message_id}... ".white
+              if message = read_resource_from_helpmonks('conversation', message_id)
+                save_message_on_front(message)
+              end
+            end
+          else
+            puts "--> Error reading messages with status #{status} :(".red
+          end
+        end
+
+
+      end
+    end
+
+    def requesting_helpmonks(vcr_cassette, restclient_options, &block)
+      VCR.use_cassette(vcr_cassette) do
+        @raw_response = RestClient::Request.new({
+          user: @helpmonks_token,
+          password: 'X',
+          timeout: 360,
+          headers: {
+            content_type: :json,
+            accept: :json
+          }
+        }.merge(restclient_options)).execute
+      end
+      response = JSON.parse(@raw_response.body)
+      yield response['success'], response['results']
+    end
+end
+
+Migrate.start(ARGV)

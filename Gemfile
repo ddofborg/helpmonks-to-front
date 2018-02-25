@@ -1,0 +1,11 @@
+source 'https://rubygems.org'
+ruby '2.4.1'
+
+gem 'awesome_print'
+gem 'thor'
+gem 'rest-client'
+gem 'pry'
+gem 'vcr'
+gem 'webmock'
+gem 'frontapp'
+gem 'activesupport'
